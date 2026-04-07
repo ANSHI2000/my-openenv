@@ -1,0 +1,96 @@
+name: healthcare-appointment-scheduling
+description: |
+  Healthcare Appointment Scheduling RL Environment
+  AI agent learns to optimally assign patients to appointment slots while
+  prioritizing urgent cases, respecting doctor specialties, and avoiding conflicts.
+
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+
+tasks:
+  - name: easy
+    description: Schedule as many patients as possible (single doctor, basic urgency)
+    objectives:
+      - Maximize scheduled patients
+      - Prioritize urgent (high/emergency) cases
+      - Minimal scheduling conflicts
+    
+  - name: medium
+    description: Multiple doctors with specialty constraints and urgency prioritization
+    objectives:
+      - Schedule all patients respecting specialty constraints
+      - Prioritize high-urgency patients to earlier slots
+      - Maintain doctor workload balance
+      - Zero slot conflicts
+    
+  - name: hard
+    description: Complex optimization with emergency walk-ins, specialists, and rescheduling
+    objectives:
+      - Schedule all patients including emergency walk-ins
+      - Emergency cases MUST use priority slots
+      - Respect specialty-doctor mappings
+      - Minimize unsafe delays (emergency waiting >20 min incurs penalties)
+      - Handle dynamic rescheduling
+
+action_space:
+  - type: assign_patient
+    params: [patient_id, slot_id, doctor_id]
+    description: Assign a waiting patient to a time slot with a doctor
+    
+  - type: reschedule_patient
+    params: [patient_id, slot_id]
+    description: Move a scheduled patient to a different slot (medium/hard only)
+    
+  - type: escalate_urgent_case
+    params: [patient_id]
+    description: Mark patient as emergency (increases priority)
+    
+  - type: mark_no_show
+    params: [patient_id]
+    description: Cancel patient appointment (frees slot)
+    
+  - type: close_schedule
+    params: []
+    description: Finalize scheduling and end session
+
+observation_space:
+  task_name: str
+  objective: str
+  step_count: int
+  max_steps: int
+  patients: list[Patient]
+  doctors: list[Doctor]
+  time_slots: list[TimeSlot]
+  appointments: list[Appointment]
+  recent_events: list[Event]
+  available_actions: list[ActionType]
+  metrics:
+    patients_scheduled: int
+    urgent_patients_scheduled: int
+    emergency_cases_handled: int
+    scheduling_conflicts: int
+
+reward_design:
+  base_structure: step_reward + per_step_penalty
+  step_reward_components:
+    successful_assignment: +0.05 to +0.25 (based on urgency)
+    emergency_handling: +0.15
+    urgent_priority_bonus: +0.1 to +0.2
+    failed_action: -0.05 to -0.1
+  per_step_penalty: -0.01
+  final_score_normalization: [0.0, 1.0]
+  deterministic: true
+
+validation:
+  inference_compliance:
+    openai_client_required: true
+    stdout_format: "[START]...[STEP]...[END]"
+    environment_variables: [API_BASE_URL, MODEL_NAME, HF_TOKEN, LOCAL_IMAGE_NAME]
+  
+  submission_requirements:
+    dockerfile: required
+    inference_script: required
+    deterministic_graders: required
+    all_three_tasks: required
