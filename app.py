@@ -46,12 +46,8 @@ def reset(request: ResetRequest = None):
             request = ResetRequest(task="easy")
         
         observation = env.reset(request)
+        return observation.model_dump()
         
-        return {
-            "success": True,
-            "observation": observation.model_dump(),
-            "error": None
-        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -74,14 +70,8 @@ def step(request: StepRequest):
             raise ValueError("Action required in request")
         
         result = env.step(request.action)
+        return result.model_dump()
         
-        return {
-            "success": True,
-            "observation": result.observation.model_dump(),
-            "reward": result.reward.model_dump(),
-            "done": result.done,
-            "error": None
-        }
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid action: {str(e)}")
     except ValueError as e:
@@ -100,12 +90,7 @@ def get_state():
     """
     try:
         state = env.get_state()
-        
-        return {
-            "success": True,
-            "state": state,
-            "error": None
-        }
+        return state
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"State retrieval failed: {str(e)}")
 
