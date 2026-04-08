@@ -1,210 +1,210 @@
-"""
-Healthcare Appointment Scheduling - Baseline Inference Script
-Uses OpenAI Client with environment variables for LLM calls
-Implements [START]/[STEP]/[END] logging format
-"""
+from __future__ import annotations
 
-import asyncio
 import json
 import os
-import sys
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
+
+import httpx
 from openai import OpenAI
-import requests
 
-
-# MANDATORY: Environment variables for LLM inference
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY = os.getenv("API_KEY", os.getenv("HF_TOKEN", ""))  # Fallback to HF_TOKEN for backward compatibility
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "healthcare-scheduling")
+HF_TOKEN = os.getenv("HF_TOKEN")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860").rstrip("/")
+MAX_STEPS_OVERRIDE = os.getenv("MAX_STEPS")
 
-# Environment constants
-ENV_API_URL = os.getenv("ENV_API_BASE_URL", "http://localhost:8000")
-TASK_NAME = os.getenv("TASK", "easy")
-MAX_STEPS = 30
+TASKS = [
+    "easy",
+    "medium",
+    "hard",
+]
 BENCHMARK = "healthcare-appointment-scheduling"
+
+SYSTEM_PROMPT = (
+    "You are a healthcare scheduling AI agent. Return exactly one action in JSON with keys "
+    "action_type, patient_id, slot_id, and doctor_id. Pick only from available_actions and known entities."
+)
 
 
 def log_start(task: str, env: str, model: str) -> None:
-    """Log episode start in [START] format"""
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str] = None) -> None:
-    """Log step in [STEP] format"""
-    error_str = f" error={error}" if error else ""
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done}{error_str}", flush=True)
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    done_val = str(done).lower()
+    error_val = error if error else "null"
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    """Log end in [END] format"""
     rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else ""
-    print(f"[END] success={success} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
 
 
-def get_ai_action(client: OpenAI, observation: dict, step: int) -> Optional[dict]:
-    """
-    Get next action from AI model using OpenAI Client
+def _default_action(observation: Dict[str, object], completed: set[Tuple[str, str]]) -> Dict[str, str]:
+    """Return a safe default action"""
+    patients = observation.get("patients", []) if isinstance(observation, dict) else []
     
-    Args:
-        client: OpenAI client instance
-        observation: Current environment observation
-        step: Current step number
-        
-    Returns:
-        Parsed action dict or None
-    """
+    waiting_patients = [p for p in patients if isinstance(p, dict) and p.get("status") == "waiting"]
+    
+    if waiting_patients:
+        patient = waiting_patients[0]
+        return {
+            "action_type": "assign_patient",
+            "patient_id": str(patient.get("id", 1)),
+            "slot_id": "0",
+            "doctor_id": "1"
+        }
+    
+    return {"action_type": "close_schedule"}
+
+
+def _parse_action(content: str) -> Optional[Dict[str, str]]:
+    text = (content or "").strip()
+    if not text:
+        return None
+
     try:
-        patients = observation.get("patients", [])
-        appointments = observation.get("appointments", [])
-        time_slots = observation.get("time_slots", [])
-        recent_events = observation.get("recent_events", [])
-        
-        # Build scheduling state summary
-        waiting_patients = [p for p in patients if p.get("status") == "waiting"]
-        scheduled_count = len(appointments)
-        
-        prompt = f"""You are an expert healthcare scheduling AI agent.
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "action_type" in obj:
+            return {
+                "action_type": str(obj.get("action_type", "")),
+                "patient_id": str(obj.get("patient_id", "1")),
+                "slot_id": str(obj.get("slot_id", "0")),
+                "doctor_id": str(obj.get("doctor_id", "1")),
+            }
+    except json.JSONDecodeError:
+        pass
 
-CURRENT STATE:
-- Task: {observation.get('task_name')}
-- Objective: {observation.get('objective')}
-- Step: {step}/{MAX_STEPS}
-- Patients scheduled: {scheduled_count}/{len(patients)}
-- Waiting patients: {len(waiting_patients)}
-- Recent events: {[e.get('details') for e in recent_events[-2:]]}
+    return None
 
-AVAILABLE ACTIONS:
-1. assign_patient: Assign waiting patient to available slot
-2. escalate_urgent_case: Mark patient as emergency
-3. reschedule_patient: Move scheduled patient (if allowed)
-4. mark_no_show: Cancel patient appointment
-5. close_schedule: Finalize and end session
 
-STRATEGY:
-- Schedule HIGH and EMERGENCY urgency patients first
-- Assign urgent cases to priority slots (earliest times)
-- Avoid double-booking conflicts
-- Handle emergency walk-ins immediately
+def choose_action(
+    client: OpenAI,
+    task_name: str,
+    observation: Dict[str, object],
+    completed: set[Tuple[str, str]],
+) -> Dict[str, str]:
+    user_prompt = json.dumps(
+        {
+            "task": task_name,
+            "objective": observation.get("objective"),
+            "step_count": observation.get("step_count"),
+            "max_steps": observation.get("max_steps"),
+            "recent_events": observation.get("recent_events"),
+            "available_actions": observation.get("available_actions"),
+            "patients": observation.get("patients"),
+            "response_format": {"action_type": "string", "patient_id": "int", "slot_id": "int", "doctor_id": "int"},
+        }
+    )
 
-Choose the optimal action. Respond with ONLY valid JSON (no explanation):
-{{"action_type": "assign_patient", "patient_id": 1, "slot_id": 0, "doctor_id": 1}}
-OR
-{{"action_type": "escalate_urgent_case", "patient_id": 2}}
-OR
-{{"action_type": "close_schedule"}}
-"""
-        
-        response = client.chat.completions.create(
+    try:
+        res = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=200
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            max_tokens=200,
+            stream=False,
         )
-        
-        response_text = response.choices[0].message.content.strip()
-        action = json.loads(response_text)
-        return action
-        
-    except json.JSONDecodeError as e:
-        print(f"[DEBUG] JSON parse error: {e}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"[DEBUG] Model error: {e}", file=sys.stderr)
-        return None
+        text = (res.choices[0].message.content or "").strip()
+        parsed = _parse_action(text)
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+
+    return _default_action(observation, completed)
 
 
-async def main() -> None:
-    """Main inference loop"""
-    
-    # Validate API_KEY
-    if not API_KEY:
-        log_start(TASK_NAME, BENCHMARK, MODEL_NAME)
-        log_step(1, "<none>", 0.0, True, "API_KEY environment variable not set")
-        log_end(False, 0, 0.0, [])
-        return
-    
-    # Initialize OpenAI client with API_BASE_URL and API_KEY
-    try:
-        client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
-    except Exception as e:
-        log_start(TASK_NAME, BENCHMARK, MODEL_NAME)
-        log_step(1, "<none>", 0.0, True, f"Failed to initialize OpenAI client: {e}")
-        log_end(False, 0, 0.0, [])
-        return
-    
-    # Log start
-    log_start(TASK_NAME, BENCHMARK, MODEL_NAME)
-    
+def run_task(client: OpenAI, http_client: httpx.Client, task_name: str) -> float:
     rewards: List[float] = []
     steps_taken = 0
+    score = 0.0
     success = False
-    
+    completed: set[Tuple[str, str]] = set()
+
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+
     try:
-        # Reset environment
-        reset_response = requests.post(
-            f"{ENV_API_URL}/reset",
-            json={"task": TASK_NAME},
-            timeout=10
-        )
-        reset_response.raise_for_status()
-        reset_data = reset_response.json()
-        observation = reset_data.get("observation", {})
-        
-        # Main episode loop
-        for step_num in range(1, MAX_STEPS + 1):
-            # Get AI action
-            action = await asyncio.to_thread(get_ai_action, client, observation, step_num)
-            
-            if not action or "action_type" not in action:
-                log_step(step_num, "<none>", 0.0, False, "Model returned no action")
-                break
-            
-            # Execute step
-            try:
-                step_response = requests.post(
-                    f"{ENV_API_URL}/step",
-                    json={"action": action},
-                    timeout=10
-                )
-                step_response.raise_for_status()
-                result = step_response.json()
-            except Exception as e:
-                log_step(step_num, str(action.get("action_type")), 0.0, False, f"Step failed: {e}")
-                break
-            
-            # Extract results
-            observation = result.get("observation", {})
-            reward_obj = result.get("reward", {})
-            step_reward = reward_obj.get("step_reward", 0.0)
-            done = result.get("done", False)
-            
-            rewards.append(step_reward)
-            steps_taken = step_num
-            
-            # Log step
-            log_step(step_num, str(action.get("action_type")), step_reward, done)
-            
+        reset_resp = http_client.post(f"{ENV_BASE_URL}/reset", json={"task": task_name}, timeout=20.0)
+        reset_resp.raise_for_status()
+        payload = reset_resp.json()
+        observation = payload.get("observation", {})
+
+        max_steps = int(observation.get("max_steps") or 10)
+        if MAX_STEPS_OVERRIDE:
+            max_steps = int(MAX_STEPS_OVERRIDE)
+
+        done = bool(payload.get("done", False))
+
+        for step in range(1, max_steps + 1):
             if done:
                 break
-        
-        # Calculate final score from environment
-        if observation and "episode_score" in observation:
-            final_score = observation.get("episode_score", 0.0)
-        else:
-            final_score = sum(rewards) / len(rewards) if rewards else 0.0
-        
-        final_score = max(0.0, min(1.0, final_score))
-        success = final_score > 0.0 and steps_taken > 0
-    
-    except Exception as e:
-        print(f"[DEBUG] Episode error: {e}", file=sys.stderr)
-        final_score = 0.0
-    
-    # Log end
-    log_end(success, steps_taken, final_score, rewards)
+
+            action = choose_action(client=client, task_name=task_name, observation=observation, completed=completed)
+            action_type = action.get("action_type", "assign_patient")
+            action_str = f"{action_type}({action.get('patient_id', '?')})"
+
+            step_resp = http_client.post(
+                f"{ENV_BASE_URL}/step",
+                json={
+                    "action": {
+                        "action_type": action_type,
+                        "patient_id": int(action.get("patient_id", 1)),
+                        "slot_id": int(action.get("slot_id", 0)),
+                        "doctor_id": int(action.get("doctor_id", 1)),
+                    }
+                },
+                timeout=20.0,
+            )
+            step_resp.raise_for_status()
+            step_payload = step_resp.json()
+
+            reward = float(step_payload.get("reward", {}).get("step_reward", 0.0) or 0.0)
+            done = bool(step_payload.get("done", False))
+            observation = step_payload.get("observation", {})
+
+            rewards.append(reward)
+            steps_taken = step
+
+            log_step(step=step, action=action_str, reward=reward, done=done, error=None)
+
+            if done:
+                break
+
+        score = float(observation.get("episode_score", 0.0) or 0.0)
+        score = max(0.0, min(1.0, score))
+        success = score > 0.0 and steps_taken > 0
+
+    except Exception:
+        success = False
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    return score
+
+
+def main() -> None:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is required")
+
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
+    with httpx.Client() as http_client:
+        scores = []
+        for task in TASKS:
+            scores.append(run_task(client=client, http_client=http_client, task_name=task))
+
+    _ = sum(scores) / len(scores) if scores else 0.0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
