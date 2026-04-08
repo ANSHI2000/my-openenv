@@ -46,7 +46,7 @@ def reset(request: ResetRequest = None):
             request = ResetRequest(task="easy")
         
         observation = env.reset(request)
-        return observation.model_dump()
+        return {"observation": observation.model_dump()}
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
