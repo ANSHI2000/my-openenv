@@ -130,3 +130,13 @@ def root():
         },
         "tasks": ["easy", "medium", "hard"]
     }
+
+
+def main():
+    """Main entry point for the application"""
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
+
+
+if __name__ == "__main__":
+    main()
