@@ -18,11 +18,11 @@ def grade_easy(env: HealthcareSchedulingEnv) -> float:
     - Penalty: Conflicts * 0.2
     
     Returns:
-        Score in [0, 1]
+        Score in (0, 1)
     """
     total_patients = len(env.patients)
     if total_patients == 0:
-        return 0.0
+        return 0.01
     
     # Count scheduled patients
     scheduled = sum(1 for p in env.patients if p.status == PatientStatus.SCHEDULED)
@@ -57,7 +57,7 @@ def grade_easy(env: HealthcareSchedulingEnv) -> float:
     conflict_penalty = max(0.0, 0.2 * (1 - conflicts / max(1, len(env.appointments))))
     
     score = scheduling_score + urgent_bonus - (0.2 if conflicts > 0 else conflict_penalty)
-    return max(0.0, min(1.0, score))
+    return max(0.01, min(0.99, score))
 
 
 def grade_medium(env: HealthcareSchedulingEnv) -> float:
@@ -71,11 +71,11 @@ def grade_medium(env: HealthcareSchedulingEnv) -> float:
     - No conflicts: * 0.2
     
     Returns:
-        Score in [0, 1]
+        Score in (0, 1)
     """
     total_patients = len(env.patients)
     if total_patients == 0:
-        return 0.0
+        return 0.01
     
     # Count scheduled
     scheduled = sum(1 for p in env.patients if p.status == PatientStatus.SCHEDULED)
@@ -117,12 +117,12 @@ def grade_medium(env: HealthcareSchedulingEnv) -> float:
     for apt in env.appointments:
         pair = (apt.slot_id, apt.doctor_id)
         if pair in slot_doctor_pairs:
-            conflict_score = 0.0
+            conflict_score = 0.01
             break
         slot_doctor_pairs.add(pair)
     
     score = base_score + specialty_score + urgent_first_score + conflict_score
-    return max(0.0, min(1.0, score))
+    return max(0.01, min(0.99, score))
 
 
 def grade_hard(env: HealthcareSchedulingEnv) -> float:
@@ -137,11 +137,11 @@ def grade_hard(env: HealthcareSchedulingEnv) -> float:
     - Conflict-free: * 0.15
     
     Returns:
-        Score in [0, 1]
+        Score in (0, 1)
     """
     total_patients = len(env.patients)
     if total_patients == 0:
-        return 0.0
+        return 0.01
     
     # 1. All patients scheduled bonus
     scheduled = sum(1 for p in env.patients if p.status == PatientStatus.SCHEDULED)
@@ -163,7 +163,7 @@ def grade_hard(env: HealthcareSchedulingEnv) -> float:
     for patient in emergency_patients:
         apt = next((a for a in env.appointments if a.patient_id == patient.id), None)
         if apt and apt.scheduled_time_minutes > 20:  # Unsafe if emergency waits > 20 min
-            unsafe_delay_score = 0.0
+            unsafe_delay_score = 0.01
             break
     
     # 4. Specialty compliance
@@ -175,10 +175,10 @@ def grade_hard(env: HealthcareSchedulingEnv) -> float:
     for apt in env.appointments:
         key = (apt.slot_id, apt.doctor_id)
         if key in seen_slots:
-            conflict_score = 0.0
+            conflict_score = 0.01
             break
         seen_slots.add(key)
     
     score = all_scheduled_bonus + emergency_score + unsafe_delay_score + specialty_score + conflict_score
-    return max(0.0, min(1.0, score))
+    return max(0.01, min(0.99, score))
 
