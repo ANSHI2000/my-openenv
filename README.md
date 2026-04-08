@@ -1,3 +1,12 @@
+---
+title: Healthcare Scheduling OpenEnv
+emoji: 🏥
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # Healthcare Appointment Scheduling RL Environment
 
 A healthcare appointment scheduling environment that simulates scheduler workflows:
