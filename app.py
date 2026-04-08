@@ -26,8 +26,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global environment instance
-env = HealthcareSchedulingEnv()
+# Global environment instance (lazy initialized)
+env = None
+
+def get_env():
+    """Get or initialize the environment"""
+    global env
+    if env is None:
+        env = HealthcareSchedulingEnv()
+    return env
 
 
 @app.post("/reset")
@@ -45,7 +52,7 @@ def reset(request: ResetRequest = None):
         if request is None:
             request = ResetRequest(task="easy")
         
-        observation = env.reset(request)
+        observation = get_env().reset(request)
         return {
             "observation": observation.model_dump(),
             "done": False
@@ -72,7 +79,7 @@ def step(request: StepRequest):
         if not request or not request.action:
             raise ValueError("Action required in request")
         
-        result = env.step(request.action)
+        result = get_env().step(request.action)
         return result.model_dump()
         
     except ValidationError as e:
@@ -92,7 +99,7 @@ def get_state():
         Complete environment state including all entities and metrics
     """
     try:
-        state = env.get_state()
+        state = get_env().get_state()
         return state
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"State retrieval failed: {str(e)}")
