@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "AnshikaP", email = "priyanka@example.com"}
+    {name = "AnshikaP", email = "anshika@example.com"}
 ]
 
 dependencies = [
@@ -19,7 +19,11 @@ dependencies = [
     "requests>=2.31.0",
     "pydantic>=2.0.0",
     "openai>=1.0.0",
+    "openenv-core>=0.2.0",
 ]
+
+[project.scripts]
+server = "app:app"
 
 [project.optional-dependencies]
 dev = [
