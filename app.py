@@ -39,14 +39,17 @@ def reset(request: ResetRequest = None):
         request: ResetRequest with optional task ("easy", "medium", "hard") and seed
         
     Returns:
-        Initial observation wrapped like /step endpoint
+        Initial observation with done flag
     """
     try:
         if request is None:
             request = ResetRequest(task="easy")
         
         observation = env.reset(request)
-        return {"observation": observation.model_dump()}
+        return {
+            "observation": observation.model_dump(),
+            "done": False
+        }
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
