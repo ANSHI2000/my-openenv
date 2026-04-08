@@ -39,7 +39,7 @@ def reset(request: ResetRequest = None):
         request: ResetRequest with optional task ("easy", "medium", "hard") and seed
         
     Returns:
-        Initial observation
+        Initial observation wrapped like /step endpoint
     """
     try:
         if request is None:
