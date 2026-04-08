@@ -15,8 +15,8 @@ import requests
 
 # MANDATORY: Environment variables for LLM inference
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+API_KEY = os.getenv("API_KEY", os.getenv("HF_TOKEN", ""))  # Fallback to HF_TOKEN for backward compatibility
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "healthcare-scheduling")
 
 # Environment constants
@@ -118,16 +118,16 @@ OR
 async def main() -> None:
     """Main inference loop"""
     
-    # Validate HF_TOKEN
-    if not HF_TOKEN:
+    # Validate API_KEY
+    if not API_KEY:
         log_start(TASK_NAME, BENCHMARK, MODEL_NAME)
-        log_step(1, "<none>", 0.0, True, "HF_TOKEN environment variable not set")
+        log_step(1, "<none>", 0.0, True, "API_KEY environment variable not set")
         log_end(False, 0, 0.0, [])
         return
     
-    # Initialize OpenAI client
+    # Initialize OpenAI client with API_BASE_URL and API_KEY
     try:
-        client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+        client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
     except Exception as e:
         log_start(TASK_NAME, BENCHMARK, MODEL_NAME)
         log_step(1, "<none>", 0.0, True, f"Failed to initialize OpenAI client: {e}")
