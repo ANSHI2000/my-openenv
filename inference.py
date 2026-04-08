@@ -126,7 +126,7 @@ def choose_action(
 def run_task(client: OpenAI, http_client: httpx.Client, task_name: str) -> float:
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
+    score = 0.01
     success = False
     completed: set[Tuple[str, str]] = set()
 
@@ -180,8 +180,8 @@ def run_task(client: OpenAI, http_client: httpx.Client, task_name: str) -> float
                 break
 
         score = float(observation.get("episode_score", 0.0) or 0.0)
-        score = max(0.0, min(1.0, score))
-        success = score > 0.0 and steps_taken > 0
+        score = max(0.01, min(0.99, score))
+        success = score > 0.01 and steps_taken > 0
 
     except Exception:
         success = False
