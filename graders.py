@@ -57,7 +57,7 @@ def grade_easy(env: HealthcareSchedulingEnv) -> float:
     conflict_penalty = max(0.0, 0.2 * (1 - conflicts / max(1, len(env.appointments))))
     
     score = scheduling_score + urgent_bonus - (0.2 if conflicts > 0 else conflict_penalty)
-    return max(0.01, min(0.99, score))
+    return max(0.05, min(0.95, score))
 
 
 def grade_medium(env: HealthcareSchedulingEnv) -> float:
@@ -122,7 +122,7 @@ def grade_medium(env: HealthcareSchedulingEnv) -> float:
         slot_doctor_pairs.add(pair)
     
     score = base_score + specialty_score + urgent_first_score + conflict_score
-    return max(0.01, min(0.99, score))
+    return max(0.05, min(0.95, score))
 
 
 def grade_hard(env: HealthcareSchedulingEnv) -> float:
@@ -180,5 +180,5 @@ def grade_hard(env: HealthcareSchedulingEnv) -> float:
         seen_slots.add(key)
     
     score = all_scheduled_bonus + emergency_score + unsafe_delay_score + specialty_score + conflict_score
-    return max(0.01, min(0.99, score))
+    return max(0.05, min(0.95, score))
 

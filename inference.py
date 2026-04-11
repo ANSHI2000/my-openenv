@@ -1,210 +1,279 @@
-from __future__ import annotations
+#!/usr/bin/env python
+"""
+Healthcare Appointment Scheduling - Baseline Inference
+Uses OpenAI client with LiteLLM proxy for intelligent scheduling
+"""
 
-import json
 import os
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Optional
 
-import httpx
 from openai import OpenAI
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+from models import ResetRequest, Action, ActionType, UrgencyLevel
+from env.healthcare_env import HealthcareSchedulingEnv
+from graders import grade_easy, grade_medium, grade_hard
+
+
+# Load configuration from environment - REQUIRED for LLM proxy
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860").rstrip("/")
-MAX_STEPS_OVERRIDE = os.getenv("MAX_STEPS")
-
-TASKS = [
-    "easy",
-    "medium",
-    "hard",
-]
-BENCHMARK = "healthcare-appointment-scheduling"
-
-SYSTEM_PROMPT = (
-    "You are a healthcare scheduling AI agent. Return exactly one action in JSON with keys "
-    "action_type, patient_id, slot_id, and doctor_id. Pick only from available_actions and known entities."
-)
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 
 
-def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
-
-
-def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
-    done_val = str(done).lower()
-    error_val = error if error else "null"
-    print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
-        flush=True,
+def initialize_client() -> OpenAI:
+    """Initialize OpenAI client using LiteLLM proxy with provided credentials"""
+    return OpenAI(
+        api_key=HF_TOKEN,
+        base_url=API_BASE_URL,
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else ""
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
-
-
-def _default_action(observation: Dict[str, object], completed: set[Tuple[str, str]]) -> Dict[str, str]:
-    """Return a safe default action"""
-    patients = observation.get("patients", []) if isinstance(observation, dict) else []
+def validate_action(action: Action, observation: dict) -> bool:
+    """
+    Validate action IDs exist and constraints are met.
+    Case 4-8: Prevent invalid patient/slot/doctor IDs and constraint violations
+    """
+    if action.action_type == ActionType.CLOSE_SCHEDULE:
+        return True
     
-    waiting_patients = [p for p in patients if isinstance(p, dict) and p.get("status") == "waiting"]
+    if action.action_type != ActionType.ASSIGN_PATIENT:
+        return True
     
-    if waiting_patients:
-        patient = waiting_patients[0]
-        return {
-            "action_type": "assign_patient",
-            "patient_id": str(patient.get("id", 1)),
-            "slot_id": "0",
-            "doctor_id": "1"
-        }
+    patients = observation.get("patients", [])
+    doctors = observation.get("doctors", [])
+    time_slots = observation.get("time_slots", [])
+    appointments = observation.get("appointments", [])
     
-    return {"action_type": "close_schedule"}
+    # Case 4: Validate patient exists
+    patient_ids = [p.get("id") for p in patients]
+    if action.patient_id not in patient_ids:
+        return False
+    
+    # Case 5: Validate slot exists
+    slot_ids = [s.get("slot_id") for s in time_slots]
+    if action.slot_id not in slot_ids:
+        return False
+    
+    # Case 6: Validate doctor exists
+    doctor_ids = [d.get("id") for d in doctors]
+    if action.doctor_id not in doctor_ids:
+        return False
+    
+    # Case 7: Check doctor workload not exceeded
+    doctor = next((d for d in doctors if d.get("id") == action.doctor_id), None)
+    if doctor:
+        current_load = doctor.get("current_load", 0)
+        max_load = doctor.get("max_patients_per_session", 5)
+        if current_load >= max_load:
+            return False
+    
+    # Case 8: Check slot not already assigned (conflict detection)
+    slot_reserved = any(a.get("slot_id") == action.slot_id for a in appointments)
+    if slot_reserved:
+        return False
+    
+    return True
 
 
-def _parse_action(content: str) -> Optional[Dict[str, str]]:
-    text = (content or "").strip()
-    if not text:
-        return None
-
+def get_llm_action(client: OpenAI, task_name: str, observation: dict, env: HealthcareSchedulingEnv) -> Action:
+    """
+    Use LLM via proxy to determine next scheduling action.
+    This makes an actual API call through API_BASE_URL.
+    """
+    patients = observation.get("patients", [])
+    doctors = observation.get("doctors", [])
+    time_slots = observation.get("time_slots", [])
+    scheduled = observation.get("patients_scheduled", 0)
+    total = len(patients)
+    
+    # Build context
+    prompt = f"""You are a healthcare scheduler. Task: {task_name}
+Status: {scheduled}/{total} scheduled.
+"""
+    
+    unscheduled = [p for p in patients if p.get("status") != "SCHEDULED"]
+    if unscheduled:
+        prompt += f"Next patient: ID {unscheduled[0].get('id')}, urgency {unscheduled[0].get('urgency')}\n"
+    
+    prompt += """If all scheduled, respond: CLOSE_SCHEDULE
+Otherwise respond EXACTLY: ACTION ASSIGN_PATIENT|patient_id|slot_id|doctor_id
+Available patients: [" + ", ".join(str(p.get('id')) for p in unscheduled[:3]) + "]
+"""
+    
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict) and "action_type" in obj:
-            return {
-                "action_type": str(obj.get("action_type", "")),
-                "patient_id": str(obj.get("patient_id", "1")),
-                "slot_id": str(obj.get("slot_id", "0")),
-                "doctor_id": str(obj.get("doctor_id", "1")),
-            }
-    except json.JSONDecodeError:
-        pass
-
-    return None
-
-
-def choose_action(
-    client: OpenAI,
-    task_name: str,
-    observation: Dict[str, object],
-    completed: set[Tuple[str, str]],
-) -> Dict[str, str]:
-    user_prompt = json.dumps(
-        {
-            "task": task_name,
-            "objective": observation.get("objective"),
-            "step_count": observation.get("step_count"),
-            "max_steps": observation.get("max_steps"),
-            "recent_events": observation.get("recent_events"),
-            "available_actions": observation.get("available_actions"),
-            "patients": observation.get("patients"),
-            "response_format": {"action_type": "string", "patient_id": "int", "slot_id": "int", "doctor_id": "int"},
-        }
-    )
-
-    try:
-        res = client.chat.completions.create(
+        # API call goes through API_BASE_URL configured in client
+        response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": "You are a healthcare scheduling expert. Be concise."},
+                {"role": "user", "content": prompt}
             ],
-            temperature=0.0,
-            max_tokens=200,
-            stream=False,
+            temperature=0.3,
+            max_tokens=100,
         )
-        text = (res.choices[0].message.content or "").strip()
-        parsed = _parse_action(text)
-        if parsed:
-            return parsed
-    except Exception:
-        pass
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Case 9: Robust parsing - try multiple formats
+        if "CLOSE" in response_text.upper():
+            return Action(action_type=ActionType.CLOSE_SCHEDULE)
+        
+        # Try format: ACTION ASSIGN_PATIENT|1|2|3
+        if "ACTION" in response_text and "ASSIGN" in response_text:
+            parts = response_text.split("|")
+            if len(parts) >= 4:
+                try:
+                    patient_id = int(parts[1].strip())
+                    slot_id = int(parts[2].strip())
+                    doctor_id = int(parts[3].strip())
+                    candidate_action = Action(
+                        action_type=ActionType.ASSIGN_PATIENT,
+                        patient_id=patient_id,
+                        slot_id=slot_id,
+                        doctor_id=doctor_id
+                    )
+                    # Case 4-8: Validate before returning
+                    if validate_action(candidate_action, observation):
+                        return candidate_action
+                except (ValueError, IndexError):
+                    pass
+        
+        # Try alternate format without ACTION keyword
+        if "ASSIGN" in response_text and "|" in response_text:
+            try:
+                # Extract numbers from: "assign patient 1 to slot 2 with doctor 3"
+                numbers = re.findall(r'\d+', response_text)
+                if len(numbers) >= 3:
+                    candidate_action = Action(
+                        action_type=ActionType.ASSIGN_PATIENT,
+                        patient_id=int(numbers[0]),
+                        slot_id=int(numbers[1]),
+                        doctor_id=int(numbers[2])
+                    )
+                    if validate_action(candidate_action, observation):
+                        return candidate_action
+            except (ValueError, IndexError):
+                pass
+        
+        # Fallback greedy assignment - with constraint checking
+        unscheduled_patients = [p for p in patients if p.get("status") != "SCHEDULED"]
+        if unscheduled_patients:
+            available_slots = [s for s in time_slots if s.get("available")]
+            available_doctors = [d for d in doctors if d.get("current_load", 0) < d.get("max_patients_per_session", 5)]
+            # Filter out already-assigned slots (Case 8)
+            appointments = observation.get("appointments", [])
+            reserved_slot_ids = {a.get("slot_id") for a in appointments}
+            available_slots = [s for s in available_slots if s.get("slot_id") not in reserved_slot_ids]
+            
+            if available_slots and available_doctors:
+                fallback_action = Action(
+                    action_type=ActionType.ASSIGN_PATIENT,
+                    patient_id=unscheduled_patients[0].get("id"),
+                    slot_id=available_slots[0].get("slot_id"),
+                    doctor_id=available_doctors[0].get("id")
+                )
+                if validate_action(fallback_action, observation):
+                    return fallback_action
+        
+        return Action(action_type=ActionType.CLOSE_SCHEDULE)
+        
+    except Exception as e:
+        print(f"LLM call error: {e}")
+        # Fallback to greedy without API - with constraint checking
+        unscheduled = [p for p in patients if p.get("status") != "SCHEDULED"]
+        if unscheduled:
+            available_slots = [s for s in time_slots if s.get("available")]
+            available_doctors = [d for d in doctors if d.get("current_load", 0) < d.get("max_patients_per_session", 5)]
+            # Filter out already-assigned slots
+            appointments = observation.get("appointments", [])
+            reserved_slot_ids = {a.get("slot_id") for a in appointments}
+            available_slots = [s for s in available_slots if s.get("slot_id") not in reserved_slot_ids]
+            
+            if available_slots and available_doctors:
+                fallback_action = Action(
+                    action_type=ActionType.ASSIGN_PATIENT,
+                    patient_id=unscheduled[0].get("id"),
+                    slot_id=available_slots[0].get("slot_id"),
+                    doctor_id=available_doctors[0].get("id")
+                )
+                if validate_action(fallback_action, observation):
+                    return fallback_action
+        return Action(action_type=ActionType.CLOSE_SCHEDULE)
 
-    return _default_action(observation, completed)
 
-
-def run_task(client: OpenAI, http_client: httpx.Client, task_name: str) -> float:
-    rewards: List[float] = []
-    steps_taken = 0
-    score = 0.01
-    success = False
-    completed: set[Tuple[str, str]] = set()
-
-    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
-
-    try:
-        reset_resp = http_client.post(f"{ENV_BASE_URL}/reset", json={"task": task_name}, timeout=20.0)
-        reset_resp.raise_for_status()
-        payload = reset_resp.json()
-        observation = payload.get("observation", {})
-
-        max_steps = int(observation.get("max_steps") or 10)
-        if MAX_STEPS_OVERRIDE:
-            max_steps = int(MAX_STEPS_OVERRIDE)
-
-        done = bool(payload.get("done", False))
-
-        for step in range(1, max_steps + 1):
-            if done:
-                break
-
-            action = choose_action(client=client, task_name=task_name, observation=observation, completed=completed)
-            action_type = action.get("action_type", "assign_patient")
-            action_str = f"{action_type}({action.get('patient_id', '?')})"
-
-            step_resp = http_client.post(
-                f"{ENV_BASE_URL}/step",
-                json={
-                    "action": {
-                        "action_type": action_type,
-                        "patient_id": int(action.get("patient_id", 1)),
-                        "slot_id": int(action.get("slot_id", 0)),
-                        "doctor_id": int(action.get("doctor_id", 1)),
-                    }
-                },
-                timeout=20.0,
-            )
-            step_resp.raise_for_status()
-            step_payload = step_resp.json()
-
-            reward = float(step_payload.get("reward", {}).get("step_reward", 0.0) or 0.0)
-            done = bool(step_payload.get("done", False))
-            observation = step_payload.get("observation", {})
-
-            rewards.append(reward)
-            steps_taken = step
-
-            log_step(step=step, action=action_str, reward=reward, done=done, error=None)
-
-            if done:
-                break
-
-        score = float(observation.get("episode_score", 0.0) or 0.0)
-        score = max(0.01, min(0.99, score))
-        success = score > 0.01 and steps_taken > 0
-
-    except Exception:
-        success = False
-
-    finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-
+def run_episode(task: str = "easy") -> float:
+    """Run episode with LLM-based scheduling"""
+    print(f"[START] {task}")
+    
+    client = initialize_client()
+    env = HealthcareSchedulingEnv()
+    observation = env.reset(ResetRequest(task=task))
+    
+    step_count = 0
+    while step_count < 100:
+        step_count += 1
+        action = get_llm_action(client, observation.task_name, observation.model_dump(), env)
+        result = env.step(action)
+        observation = result.observation
+        print(f"[STEP] {step_count}: {action.action_type.value} - Score {result.reward.episode_score:.3f}")
+        if result.done:
+            break
+    
+    if task == "easy":
+        score = grade_easy(env)
+    elif task == "medium":
+        score = grade_medium(env)
+    else:
+        score = grade_hard(env)
+    
+    print(f"[END] {task} - Final score {score:.3f}")
     return score
 
 
-def main() -> None:
-    if not HF_TOKEN:
-        raise RuntimeError("HF_TOKEN is required")
-
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
-
-    with httpx.Client() as http_client:
-        scores = []
-        for task in TASKS:
-            scores.append(run_task(client=client, http_client=http_client, task_name=task))
-
-    _ = sum(scores) / len(scores) if scores else 0.0
+def main():
+    """Main entry - run all tasks with LLM proxy"""
+    print("="*70)
+    print("HEALTHCARE SCHEDULING - LLM INFERENCE WITH API PROXY")
+    print("="*70)
+    
+    # Case 2: Validate HF_TOKEN is set
+    if not HF_TOKEN or HF_TOKEN.strip() == "":
+        print("FATAL ERROR: HF_TOKEN environment variable not set or empty")
+        print("Set it with: $env:HF_TOKEN='your-huggingface-token'")
+        return 1
+    
+    if not API_BASE_URL or API_BASE_URL.strip() == "":
+        print("FATAL ERROR: API_BASE_URL environment variable not set or empty")
+        print("Set it with: $env:API_BASE_URL='https://router.huggingface.co/v1'")
+        return 1
+    
+    print(f"Using LLM proxy at: {API_BASE_URL}")
+    print(f"Model: {MODEL_NAME}")
+    print()
+    
+    try:
+        easy_score = run_episode("easy")
+        medium_score = run_episode("medium")
+        hard_score = run_episode("hard")
+        
+        print("\n" + "="*70)
+        print("SUMMARY")
+        print("="*70)
+        print(f"Easy:   {easy_score:.3f}")
+        print(f"Medium: {medium_score:.3f}")
+        print(f"Hard:   {hard_score:.3f}")
+        print(f"Average: {(easy_score + medium_score + hard_score) / 3:.3f}")
+        print("="*70)
+        
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main() if main() is not None else 0)
